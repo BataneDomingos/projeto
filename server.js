@@ -3,7 +3,7 @@ dotenv.config();
 
 import express from 'express';
 import cors from 'cors';
-import mysql from 'mysql2/promise';
+import { Pool } from 'pg';
 import jwt from 'jsonwebtoken';
 import cookieParser from 'cookie-parser';
 import PDFDocument from 'pdfkit';
@@ -16,30 +16,36 @@ app.use(cors());
 app.use(express.json());
 app.use(cookieParser());
 
-// Database Connection
-const dbConfig = {
+// Database Connection - PostgreSQL
+const pool = new Pool({
   host: process.env.DB_HOST,
-  port: process.env.DB_PORT || 3306, // Adiciona essa linha
+  port: process.env.DB_PORT || 5432,
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
-};
-
-
-// Create database connection pool
-const pool = mysql.createPool(dbConfig);
+  ssl: {
+    rejectUnauthorized: false
+  }
+});
 
 // Test database connection
 async function testConnection() {
+  let client;
   try {
-    const connection = await pool.getConnection();
-    console.log('Database connection successful');
-    connection.release();
+    client = await pool.connect();
+    console.log('🟢 PostgreSQL conectado com sucesso!');
   } catch (error) {
-    console.error('Database connection failed:', error);
+    console.error('🔴 Erro ao conectar no PostgreSQL:', error);
     process.exit(1);
+  } finally {
+    if (client) client.release();
   }
 }
+
+// Rota de teste
+app.get('/', (req, res) => {
+  res.send('Servidor com PostgreSQL ativo 🚀');
+});
 
 // Authentication middleware
 const authenticateToken = (req, res, next) => {
@@ -68,16 +74,16 @@ app.post('/api/auth/login', async (req, res) => {
   try {
     const { username, password } = req.body;
     
-    const [users] = await pool.query(
-      'SELECT * FROM users WHERE username = ?',
+    const result = await pool.query(
+      'SELECT * FROM users WHERE username = $1',
       [username]
     );
     
-    if (users.length === 0) {
+    if (result.rows.length === 0) {
       return res.status(401).json({ message: 'Credenciais inválidas' });
     }
     
-    const user = users[0];
+    const user = result.rows[0];
     
     // Since we're storing passwords as plain text as requested
     if (password !== user.password) {
@@ -104,8 +110,8 @@ app.post('/api/auth/login', async (req, res) => {
 // Products routes
 app.get('/api/products', authenticateToken, async (req, res) => {
   try {
-    const [products] = await pool.query('SELECT * FROM products');
-    res.json(products);
+    const result = await pool.query('SELECT * FROM products');
+    res.json(result.rows);
   } catch (error) {
     console.error('Error fetching products:', error);
     res.status(500).json({ message: 'Erro ao buscar produtos' });
@@ -114,16 +120,16 @@ app.get('/api/products', authenticateToken, async (req, res) => {
 
 app.get('/api/products/:id', authenticateToken, async (req, res) => {
   try {
-    const [products] = await pool.query(
-      'SELECT * FROM products WHERE id = ?',
+    const result = await pool.query(
+      'SELECT * FROM products WHERE id = $1',
       [req.params.id]
     );
     
-    if (products.length === 0) {
+    if (result.rows.length === 0) {
       return res.status(404).json({ message: 'Produto não encontrado' });
     }
     
-    res.json(products[0]);
+    res.json(result.rows[0]);
   } catch (error) {
     console.error('Error fetching product:', error);
     res.status(500).json({ message: 'Erro ao buscar produto' });
@@ -136,28 +142,27 @@ app.post('/api/products', authenticateToken, isAdmin, async (req, res) => {
     const { name, category, price, stock, serial_code } = req.body;
 
     // Check for duplicate serial_code
-    const [existingProducts] = await pool.query(
-      'SELECT * FROM products WHERE serial_code = ?',
+    const existingResult = await pool.query(
+      'SELECT * FROM products WHERE serial_code = $1',
       [serial_code]
     );
 
-    if (existingProducts.length > 0) {
+    if (existingResult.rows.length > 0) {
       return res.status(400).json({ message: 'Código serial já está em uso' });
     }
 
-    const [result] = await pool.query(
-      'INSERT INTO products (name, category, price, stock, serial_code) VALUES (?, ?, ?, ?, ?)',
+    const result = await pool.query(
+      'INSERT INTO products (name, category, price, stock, serial_code) VALUES ($1, $2, $3, $4, $5) RETURNING *',
       [name, category, price, stock, serial_code]
     );
 
-    const id = result.insertId;
-    res.status(201).json({ id, name, category, price, stock, serial_code });
+    res.status(201).json(result.rows[0]);
   } catch (error) {
     console.error('Error creating product:', error);
-    if (error.code === 'ER_BAD_FIELD_ERROR') {
+    if (error.code === '42703') {
       return res.status(500).json({ message: 'Erro: Coluna serial_code não encontrada na tabela de produtos. Contate o administrador.' });
     }
-    if (error.code === 'ER_DUP_ENTRY') {
+    if (error.code === '23505') {
       return res.status(400).json({ message: 'Código serial já está em uso' });
     }
     res.status(500).json({ message: 'Erro ao criar produto' });
@@ -170,27 +175,31 @@ app.put('/api/products/:id', authenticateToken, isAdmin, async (req, res) => {
     const { name, category, price, stock, serial_code } = req.body;
 
     // Check for duplicate serial_code, excluding the current product
-    const [existingProducts] = await pool.query(
-      'SELECT * FROM products WHERE serial_code = ? AND id != ?',
+    const existingResult = await pool.query(
+      'SELECT * FROM products WHERE serial_code = $1 AND id != $2',
       [serial_code, req.params.id]
     );
 
-    if (existingProducts.length > 0) {
+    if (existingResult.rows.length > 0) {
       return res.status(400).json({ message: 'Código serial já está em uso' });
     }
 
-    await pool.query(
-      'UPDATE products SET name = ?, category = ?, price = ?, stock = ?, serial_code = ? WHERE id = ?',
+    const result = await pool.query(
+      'UPDATE products SET name = $1, category = $2, price = $3, stock = $4, serial_code = $5 WHERE id = $6 RETURNING *',
       [name, category, price, stock, serial_code, req.params.id]
     );
 
-    res.json({ id: parseInt(req.params.id), name, category, price, stock, serial_code });
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Produto não encontrado' });
+    }
+
+    res.json(result.rows[0]);
   } catch (error) {
     console.error('Error updating product:', error);
-    if (error.code === 'ER_BAD_FIELD_ERROR') {
+    if (error.code === '42703') {
       return res.status(500).json({ message: 'Erro: Coluna serial_code não encontrada na tabela de produtos. Contate o administrador.' });
     }
-    if (error.code === 'ER_DUP_ENTRY') {
+    if (error.code === '23505') {
       return res.status(400).json({ message: 'Código serial já está em uso' });
     }
     res.status(500).json({ message: 'Erro ao atualizar produto' });
@@ -200,10 +209,14 @@ app.put('/api/products/:id', authenticateToken, isAdmin, async (req, res) => {
 // Delete product
 app.delete('/api/products/:id', authenticateToken, isAdmin, async (req, res) => {
   try {
-    await pool.query(
-      'DELETE FROM products WHERE id = ?',
+    const result = await pool.query(
+      'DELETE FROM products WHERE id = $1 RETURNING *',
       [req.params.id]
     );
+    
+    if (result.rowCount === 0) {
+      return res.status(404).json({ message: 'Produto não encontrado' });
+    }
     
     res.status(204).send();
   } catch (error) {
@@ -215,8 +228,8 @@ app.delete('/api/products/:id', authenticateToken, isAdmin, async (req, res) => 
 // Users routes
 app.get('/api/users', authenticateToken, isAdmin, async (req, res) => {
   try {
-    const [users] = await pool.query('SELECT id, username, name, role FROM users');
-    res.json(users);
+    const result = await pool.query('SELECT id, username, name, role FROM users');
+    res.json(result.rows);
   } catch (error) {
     console.error('Error fetching users:', error);
     res.status(500).json({ message: 'Erro ao buscar usuários' });
@@ -225,17 +238,16 @@ app.get('/api/users', authenticateToken, isAdmin, async (req, res) => {
 
 app.get('/api/users/:id', authenticateToken, isAdmin, async (req, res) => {
   try {
-    const [users] = await pool.query(
-      'SELECT * FROM users WHERE id = ?',
+    const result = await pool.query(
+      'SELECT id, username, name, role FROM users WHERE id = $1',
       [req.params.id]
     );
     
-    if (users.length === 0) {
+    if (result.rows.length === 0) {
       return res.status(404).json({ message: 'Usuário não encontrado' });
     }
     
-    const user = users[0];
-    res.json(user);
+    res.json(result.rows[0]);
   } catch (error) {
     console.error('Error fetching user:', error);
     res.status(500).json({ message: 'Erro ao buscar usuário' });
@@ -247,24 +259,26 @@ app.post('/api/users', authenticateToken, isAdmin, async (req, res) => {
     const { username, password, name, role } = req.body;
     
     // Check if username already exists
-    const [existingUsers] = await pool.query(
-      'SELECT * FROM users WHERE username = ?',
+    const existingResult = await pool.query(
+      'SELECT * FROM users WHERE username = $1',
       [username]
     );
     
-    if (existingUsers.length > 0) {
+    if (existingResult.rows.length > 0) {
       return res.status(400).json({ message: 'Nome de usuário já existe' });
     }
     
-    const [result] = await pool.query(
-      'INSERT INTO users (username, password, name, role) VALUES (?, ?, ?, ?)',
+    const result = await pool.query(
+      'INSERT INTO users (username, password, name, role) VALUES ($1, $2, $3, $4) RETURNING id, username, name, role',
       [username, password, name, role]
     );
     
-    const id = result.insertId;
-    res.status(201).json({ id, username, name, role });
+    res.status(201).json(result.rows[0]);
   } catch (error) {
     console.error('Error creating user:', error);
+    if (error.code === '23505') {
+      return res.status(400).json({ message: 'Nome de usuário já existe' });
+    }
     res.status(500).json({ message: 'Erro ao criar usuário' });
   }
 });
@@ -273,31 +287,43 @@ app.put('/api/users/:id', authenticateToken, isAdmin, async (req, res) => {
   try {
     const { username, password, name, role } = req.body;
     
+    let result;
     if (password) {
-      await pool.query(
-        'UPDATE users SET username = ?, password = ?, name = ?, role = ? WHERE id = ?',
+      result = await pool.query(
+        'UPDATE users SET username = $1, password = $2, name = $3, role = $4 WHERE id = $5 RETURNING id, username, name, role',
         [username, password, name, role, req.params.id]
       );
     } else {
-      await pool.query(
-        'UPDATE users SET username = ?, name = ?, role = ? WHERE id = ?',
+      result = await pool.query(
+        'UPDATE users SET username = $1, name = $2, role = $3 WHERE id = $4 RETURNING id, username, name, role',
         [username, name, role, req.params.id]
       );
     }
     
-    res.json({ id: parseInt(req.params.id), username, name, role });
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Usuário não encontrado' });
+    }
+    
+    res.json(result.rows[0]);
   } catch (error) {
     console.error('Error updating user:', error);
+    if (error.code === '23505') {
+      return res.status(400).json({ message: 'Nome de usuário já existe' });
+    }
     res.status(500).json({ message: 'Erro ao atualizar usuário' });
   }
 });
 
 app.delete('/api/users/:id', authenticateToken, isAdmin, async (req, res) => {
   try {
-    await pool.query(
-      'DELETE FROM users WHERE id = ?',
+    const result = await pool.query(
+      'DELETE FROM users WHERE id = $1 RETURNING *',
       [req.params.id]
     );
+    
+    if (result.rowCount === 0) {
+      return res.status(404).json({ message: 'Usuário não encontrado' });
+    }
     
     res.status(204).send();
   } catch (error) {
@@ -319,21 +345,22 @@ app.get('/api/sales', authenticateToken, async (req, res) => {
     
     // If not admin, only show own sales
     if (req.user.role !== 'admin') {
-      query += ' WHERE s.vendor_id = ?';
+      query += ' WHERE s.vendor_id = $1';
       params.push(req.user.id);
     }
     
     query += ' ORDER BY s.date DESC';
     
-    const [sales] = await pool.query(query, params);
+    const salesResult = await pool.query(query, params);
     
     // Get items for each sale
+    const sales = salesResult.rows;
     for (const sale of sales) {
-      const [items] = await pool.query(
-        'SELECT * FROM sale_items WHERE sale_id = ?',
+      const itemsResult = await pool.query(
+        'SELECT * FROM sale_items WHERE sale_id = $1',
         [sale.id]
       );
-      sale.items = items;
+      sale.items = itemsResult.rows;
     }
     
     res.json(sales);
@@ -345,19 +372,19 @@ app.get('/api/sales', authenticateToken, async (req, res) => {
 
 app.get('/api/sales/:id', authenticateToken, async (req, res) => {
   try {
-    const [sales] = await pool.query(
+    const salesResult = await pool.query(
       `SELECT s.*, u.name as vendor_name 
        FROM sales s
        JOIN users u ON s.vendor_id = u.id
-       WHERE s.id = ?`,
+       WHERE s.id = $1`,
       [req.params.id]
     );
     
-    if (sales.length === 0) {
+    if (salesResult.rows.length === 0) {
       return res.status(404).json({ message: 'Venda não encontrada' });
     }
     
-    const sale = sales[0];
+    const sale = salesResult.rows[0];
     
     // Check if user has access to this sale
     if (req.user.role !== 'admin' && sale.vendor_id !== req.user.id) {
@@ -365,12 +392,12 @@ app.get('/api/sales/:id', authenticateToken, async (req, res) => {
     }
     
     // Get items for this sale
-    const [items] = await pool.query(
-      'SELECT * FROM sale_items WHERE sale_id = ?',
+    const itemsResult = await pool.query(
+      'SELECT * FROM sale_items WHERE sale_id = $1',
       [sale.id]
     );
     
-    sale.items = items;
+    sale.items = itemsResult.rows;
     
     res.json(sale);
   } catch (error) {
@@ -380,10 +407,10 @@ app.get('/api/sales/:id', authenticateToken, async (req, res) => {
 });
 
 app.post('/api/sales', authenticateToken, async (req, res) => {
-  const connection = await pool.getConnection();
-  
+  let client;
   try {
-    await connection.beginTransaction();
+    client = await pool.connect();
+    await client.query('BEGIN');
     
     const { vendor_id, vendor_name, total, payment, change, items } = req.body;
     
@@ -398,16 +425,16 @@ app.post('/api/sales', authenticateToken, async (req, res) => {
         throw new Error(`Dados inválidos para o item: ${item.product_name || 'Desconhecido'}`);
       }
       
-      const [productRows] = await connection.query(
-        'SELECT stock, name FROM products WHERE id = ?',
+      const productResult = await client.query(
+        'SELECT stock, name FROM products WHERE id = $1',
         [item.product_id]
       );
       
-      if (productRows.length === 0) {
+      if (productResult.rows.length === 0) {
         throw new Error(`Produto com ID ${item.product_id} não encontrado`);
       }
       
-      const product = productRows[0];
+      const product = productResult.rows[0];
       if (product.stock < item.quantity) {
         throw new Error(
           `Estoque insuficiente para ${product.name}. Disponível: ${product.stock}, Solicitado: ${item.quantity}`
@@ -416,55 +443,55 @@ app.post('/api/sales', authenticateToken, async (req, res) => {
     }
     
     // Insert sale
-    const [saleResult] = await connection.query(
-      'INSERT INTO sales (vendor_id, date, total, payment, change_amount) VALUES (?, NOW(), ?, ?, ?)',
+    const saleResult = await client.query(
+      'INSERT INTO sales (vendor_id, date, total, payment, change_amount) VALUES ($1, NOW(), $2, $3, $4) RETURNING id',
       [vendor_id, total, payment, change]
     );
     
-    const saleId = saleResult.insertId;
+    const saleId = saleResult.rows[0].id;
     
     // Insert sale items and update product stock
     for (const item of items) {
-      await connection.query(
-        'INSERT INTO sale_items (sale_id, product_id, product_name, price, quantity, total) VALUES (?, ?, ?, ?, ?, ?)',
+      await client.query(
+        'INSERT INTO sale_items (sale_id, product_id, product_name, price, quantity, total) VALUES ($1, $2, $3, $4, $5, $6)',
         [saleId, item.product_id, item.product_name, item.price, item.quantity, item.total]
       );
       
       // Update product stock
-      await connection.query(
-        'UPDATE products SET stock = stock - ? WHERE id = ?',
+      await client.query(
+        'UPDATE products SET stock = stock - $1 WHERE id = $2',
         [item.quantity, item.product_id]
       );
     }
     
-    await connection.commit();
+    await client.query('COMMIT');
     
     // Get the created sale with items
-    const [createdSales] = await connection.query(
+    const createdSaleResult = await client.query(
       `SELECT s.*, u.name as vendor_name 
        FROM sales s
        JOIN users u ON s.vendor_id = u.id
-       WHERE s.id = ?`,
+       WHERE s.id = $1`,
       [saleId]
     );
     
-    const createdSale = createdSales[0];
+    const createdSale = createdSaleResult.rows[0];
     
     // Get items for this sale
-    const [saleItems] = await connection.query(
-      'SELECT * FROM sale_items WHERE sale_id = ?',
+    const saleItemsResult = await client.query(
+      'SELECT * FROM sale_items WHERE sale_id = $1',
       [saleId]
     );
     
-    createdSale.items = saleItems;
+    createdSale.items = saleItemsResult.rows;
     
     res.status(201).json(createdSale);
   } catch (error) {
-    await connection.rollback();
+    if (client) await client.query('ROLLBACK');
     console.error('Error creating sale:', error, { saleData: req.body });
     res.status(400).json({ message: error.message || 'Erro ao criar venda' });
   } finally {
-    connection.release();
+    if (client) client.release();
   }
 });
 
@@ -482,21 +509,22 @@ app.get('/api/reports/sales', authenticateToken, isAdmin, async (req, res) => {
     const params = [];
     
     if (startDate && endDate) {
-      query += ' WHERE s.date BETWEEN ? AND ?';
+      query += ' WHERE s.date BETWEEN $1 AND $2';
       params.push(startDate, endDate);
     }
     
     query += ' ORDER BY s.date DESC';
     
-    const [sales] = await pool.query(query, params);
+    const salesResult = await pool.query(query, params);
     
     // Get items for each sale
+    const sales = salesResult.rows;
     for (const sale of sales) {
-      const [items] = await pool.query(
-        'SELECT * FROM sale_items WHERE sale_id = ?',
+      const itemsResult = await pool.query(
+        'SELECT * FROM sale_items WHERE sale_id = $1',
         [sale.id]
       );
-      sale.items = items;
+      sale.items = itemsResult.rows;
     }
     
     res.json(sales);
@@ -511,7 +539,7 @@ app.get('/api/reports/top-products', authenticateToken, isAdmin, async (req, res
     const { limit } = req.query;
     const limitValue = limit ? parseInt(limit) : 10;
     
-    const [topProducts] = await pool.query(`
+    const result = await pool.query(`
       SELECT 
         si.product_id,
         si.product_name,
@@ -523,10 +551,10 @@ app.get('/api/reports/top-products', authenticateToken, isAdmin, async (req, res
         si.product_id, si.product_name
       ORDER BY 
         total_quantity DESC
-      LIMIT ?
+      LIMIT $1
     `, [limitValue]);
     
-    res.json(topProducts);
+    res.json(result.rows);
   } catch (error) {
     console.error('Error fetching top products:', error);
     res.status(500).json({ message: 'Erro ao buscar produtos mais vendidos' });
@@ -537,7 +565,7 @@ app.get('/api/reports/sales-by-vendor/:vendorId', authenticateToken, isAdmin, as
   try {
     const { vendorId } = req.params;
     
-    const [sales] = await pool.query(`
+    const result = await pool.query(`
       SELECT 
         s.*,
         u.name as vendor_name
@@ -546,150 +574,23 @@ app.get('/api/reports/sales-by-vendor/:vendorId', authenticateToken, isAdmin, as
       JOIN 
         users u ON s.vendor_id = u.id
       WHERE 
-        s.vendor_id = ?
+        s.vendor_id = $1
       ORDER BY 
         s.date DESC
     `, [vendorId]);
     
-    res.json(sales);
+    res.json(result.rows);
   } catch (error) {
     console.error('Error fetching sales by vendor:', error);
     res.status(500).json({ message: 'Erro ao buscar vendas por vendedor' });
   }
 });
 
-// Database initialization
-async function initializeDatabase() {
-  const connection = await pool.getConnection();
-  
-  try {
-    // Create users table
-    await connection.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        username VARCHAR(50) NOT NULL UNIQUE,
-        password VARCHAR(255) NOT NULL,
-        name VARCHAR(100) NOT NULL,
-        role ENUM('admin', 'vendor') NOT NULL
-      )
-    `);
-    
-    // Create products table
-    await connection.query(`
-      CREATE TABLE IF NOT EXISTS products (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        name VARCHAR(100) NOT NULL,
-        category VARCHAR(50) NOT NULL,
-        price DECIMAL(10, 2) NOT NULL,
-        stock INT NOT NULL DEFAULT 0,
-        serial_code VARCHAR(100) UNIQUE
-      )
-    `);
-    
-    // Check if serial_code column exists, add if missing
-    const [columns] = await connection.query(
-      `SELECT COLUMN_NAME 
-       FROM INFORMATION_SCHEMA.COLUMNS 
-       WHERE TABLE_NAME = 'products' AND TABLE_SCHEMA = ?`,
-      [dbConfig.database]
-    );
-    const hasSerialCode = columns.some(col => col.COLUMN_NAME === 'serial_code');
-    
-    if (!hasSerialCode) {
-      await connection.query(`
-        ALTER TABLE products
-        ADD COLUMN serial_code VARCHAR(100) UNIQUE
-      `);
-      console.log('Added serial_code column to products table');
-      
-      // Populate serial_code for existing products
-      const [products] = await connection.query('SELECT id FROM products');
-      for (const product of products) {
-        await connection.query(
-          'UPDATE products SET serial_code = ? WHERE id = ?',
-          [`SN${String(product.id).padStart(3, '0')}`, product.id]
-        );
-      }
-      console.log('Populated serial_code for existing products');
-    }
-    
-    // Create sales table
-    await connection.query(`
-      CREATE TABLE IF NOT EXISTS sales (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        vendor_id INT NOT NULL,
-        date DATETIME NOT NULL,
-        total DECIMAL(10, 2) NOT NULL,
-        payment DECIMAL(10, 2) NOT NULL,
-        change_amount DECIMAL(10, 2) NOT NULL,
-        FOREIGN KEY (vendor_id) REFERENCES users(id)
-      )
-    `);
-    
-    // Create sale_items table
-    await connection.query(`
-      CREATE TABLE IF NOT EXISTS sale_items (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        sale_id INT NOT NULL,
-        product_id INT NOT NULL,
-        product_name VARCHAR(100) NOT NULL,
-        price DECIMAL(10, 2) NOT NULL,
-        quantity INT NOT NULL,
-        total DECIMAL(10, 2) NOT NULL,
-        FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE
-      )
-    `);
-    
-    // Check if default admin exists
-    const [admins] = await connection.query('SELECT * FROM users WHERE role = "admin"');
-    
-    // Create default admin if none exists
-    if (admins.length === 0) {
-      await connection.query(`
-        INSERT INTO users (username, password, name, role)
-        VALUES ('admin', 'admin123', 'Administrador', 'admin')
-      `);
-      console.log('Default admin user created');
-    }
-    
-    // Add sample products if none exist
-    const [products] = await connection.query('SELECT * FROM products');
-
-    if (products.length === 0) {
-      const sampleProducts = [
-        ['SN001', 'Notebook HP', 'Eletrônicos', 25000.00, 5],
-        ['SN002', 'Smartphone Samsung', 'Eletrônicos', 8000.00, 10],
-        ['SN003', 'Televisão LG 43"', 'Eletrônicos', 12000.00, 3],
-        ['SN004', 'Teclado Sem Fio', 'Acessórios', 1500.00, 15],
-        ['SN005', 'Mouse Bluetooth', 'Acessórios', 800.00, 20],
-        ['SN006', 'Cadeira de Escritório', 'Móveis', 3500.00, 7],
-        ['SN007', 'Mesa de Trabalho', 'Móveis', 4500.00, 4],
-        ['SN008', 'Fones de Ouvido', 'Acessórios', 1200.00, 12]
-      ];
-
-      for (const product of sampleProducts) {
-        await connection.query(
-          'INSERT INTO products (serial_code, name, category, price, stock) VALUES (?, ?, ?, ?, ?)',
-          product
-        );
-      }
-
-      console.log('Sample products inserted.');
-    }
-    
-    console.log('Database initialized successfully');
-  } catch (error) {
-    console.error('Error initializing database:', error);
-  } finally {
-    connection.release();
-  }
-}
-
 // New endpoint to fetch unique categories
 app.get('/api/categories', authenticateToken, async (req, res) => {
   try {
-    const [categories] = await pool.query('SELECT DISTINCT category FROM products WHERE category IS NOT NULL AND category != "" ORDER BY category');
-    const categoryList = categories.map(row => row.category);
+    const result = await pool.query('SELECT DISTINCT category FROM products WHERE category IS NOT NULL AND category != \'\' ORDER BY category');
+    const categoryList = result.rows.map(row => row.category);
     res.json(categoryList);
   } catch (error) {
     console.error('Error fetching categories:', error);
@@ -700,27 +601,27 @@ app.get('/api/categories', authenticateToken, async (req, res) => {
 // Generate receipt PDF
 app.get('/api/receipts/:id', authenticateToken, async (req, res) => {
   try {
-    const [sales] = await pool.query(
+    const salesResult = await pool.query(
       `SELECT s.*, u.name as vendor_name 
        FROM sales s
        JOIN users u ON s.vendor_id = u.id
-       WHERE s.id = ?`,
+       WHERE s.id = $1`,
       [req.params.id]
     );
 
-    if (sales.length === 0) {
+    if (salesResult.rows.length === 0) {
       return res.status(404).json({ message: 'Venda não encontrada' });
     }
 
-    const sale = sales[0];
+    const sale = salesResult.rows[0];
 
     // Check if user has access to this sale
     if (req.user.role !== 'admin' && sale.vendor_id !== req.user.id) {
       return res.status(403).json({ message: 'Acesso negado' });
     }
 
-    const [items] = await pool.query(
-      'SELECT * FROM sale_items WHERE sale_id = ?',
+    const itemsResult = await pool.query(
+      'SELECT * FROM sale_items WHERE sale_id = $1',
       [sale.id]
     );
 
@@ -763,7 +664,7 @@ app.get('/api/receipts/:id', authenticateToken, async (req, res) => {
     // Rows
     doc.font('Helvetica');
     let y = tableTop + 20;
-    items.forEach((item) => {
+    itemsResult.rows.forEach((item) => {
       doc.text(item.product_name || 'N/A', startX, y, { width: itemWidth });
       doc.text(
         `MZN ${Number(item.price).toFixed(2)}`,
@@ -809,6 +710,132 @@ app.get('/api/receipts/:id', authenticateToken, async (req, res) => {
     res.status(500).json({ message: 'Erro ao gerar recibo' });
   }
 });
+
+// Database initialization
+async function initializeDatabase() {
+  let client;
+  try {
+    client = await pool.connect();
+    console.log('Connected to database for initialization');
+
+    // Create users table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username VARCHAR(50) NOT NULL UNIQUE,
+        password VARCHAR(255) NOT NULL,
+        name VARCHAR(100) NOT NULL,
+        role VARCHAR(50) NOT NULL CHECK (role IN ('admin', 'vendor'))
+      )
+    `);
+
+    // Create products table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS products (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        category VARCHAR(50) NOT NULL,
+        price DECIMAL(10, 2) NOT NULL,
+        stock INTEGER NOT NULL DEFAULT 0,
+        serial_code VARCHAR(100) UNIQUE
+      )
+    `);
+
+    // Check if serial_code column exists, add if missing
+    const columnsResult = await client.query(`
+      SELECT column_name 
+      FROM information_schema.columns 
+      WHERE table_name = 'products' AND table_schema = 'public'
+    `);
+    const hasSerialCode = columnsResult.rows.some(col => col.column_name === 'serial_code');
+
+    if (!hasSerialCode) {
+      await client.query(`
+        ALTER TABLE products
+        ADD COLUMN serial_code VARCHAR(100) UNIQUE
+      `);
+      console.log('Added serial_code column to products table');
+
+      // Populate serial_code for existing products
+      const productsResult = await client.query('SELECT id FROM products');
+      for (const product of productsResult.rows) {
+        await client.query(
+          'UPDATE products SET serial_code = $1 WHERE id = $2',
+          [`SN${String(product.id).padStart(3, '0')}`, product.id]
+        );
+      }
+      console.log('Populated serial_code for existing products');
+    }
+
+    // Create sales table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS sales (
+        id SERIAL PRIMARY KEY,
+        vendor_id INTEGER NOT NULL,
+        date TIMESTAMP NOT NULL,
+        total DECIMAL(10, 2) NOT NULL,
+        payment DECIMAL(10, 2) NOT NULL,
+        change_amount DECIMAL(10, 2) NOT NULL,
+        FOREIGN KEY (vendor_id) REFERENCES users(id)
+      )
+    `);
+
+    // Create sale_items table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS sale_items (
+        id SERIAL PRIMARY KEY,
+        sale_id INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        product_name VARCHAR(100) NOT NULL,
+        price DECIMAL(10, 2) NOT NULL,
+        quantity INTEGER NOT NULL,
+        total DECIMAL(10, 2) NOT NULL,
+        FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE
+      )
+    `);
+
+    // Check if default admin exists
+    const adminsResult = await client.query('SELECT * FROM users WHERE role = $1', ['admin']);
+    
+    // Create default admin if none exists
+    if (adminsResult.rows.length === 0) {
+      await client.query(`
+        INSERT INTO users (username, password, name, role)
+        VALUES ($1, $2, $3, $4)
+      `, ['admin', 'admin123', 'Administrador', 'admin']);
+      console.log('Default admin user created');
+    }
+
+    // Add sample products if none exist
+    const productsResult = await client.query('SELECT * FROM products');
+    if (productsResult.rows.length === 0) {
+      const sampleProducts = [
+        ['SN001', 'Notebook HP', 'Eletrônicos', 25000.00, 5],
+        ['SN002', 'Smartphone Samsung', 'Eletrônicos', 8000.00, 10],
+        ['SN003', 'Televisão LG 43"', 'Eletrônicos', 12000.00, 3],
+        ['SN004', 'Teclado Sem Fio', 'Acessórios', 1500.00, 15],
+        ['SN005', 'Mouse Bluetooth', 'Acessórios', 800.00, 20],
+        ['SN006', 'Cadeira de Escritório', 'Móveis', 3500.00, 7],
+        ['SN007', 'Mesa de Trabalho', 'Móveis', 4500.00, 4],
+        ['SN008', 'Fones de Ouvido', 'Acessórios', 1200.00, 12]
+      ];
+
+      for (const product of sampleProducts) {
+        await client.query(
+          'INSERT INTO products (serial_code, name, category, price, stock) VALUES ($1, $2, $3, $4, $5)',
+          product
+        );
+      }
+      console.log('Sample products inserted.');
+    }
+
+    console.log('Database initialized successfully');
+  } catch (error) {
+    console.error('Error initializing database:', error);
+  } finally {
+    if (client) client.release();
+  }
+}
 
 // Start the server
 async function startServer() {
